@@ -112,7 +112,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 # else:
                 input_ids1 = input_ids1.to(accelerator.device)
                 input_ids2 = input_ids2.to(accelerator.device)
-                encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                encoder_hidden_states1_target, encoder_hidden_states2_target, pool2_target = train_util.get_hidden_states_sdxl(
                     args.max_token_length,
                     input_ids1,
                     input_ids2,
@@ -144,6 +144,66 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
             # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
             # logger.info("text encoder outputs verified")
+
+        # 计算正向提示词的嵌入
+        positive_input_ids = batch["positive_input_ids"].to(accelerator.device)
+        positive_input_ids2 = batch["positive_input_ids2"].to(accelerator.device)
+        encoder_hidden_states1_positive, encoder_hidden_states2_positive, pool2_positive = train_util.get_hidden_states_sdxl(
+            args.max_token_length,
+            positive_input_ids,
+            positive_input_ids2,
+            tokenizers[0],
+            tokenizers[1],
+            text_encoders[0],
+            text_encoders[1],
+            None if not args.full_fp16 else weight_dtype,
+            accelerator=accelerator,
+        )
+
+        # 计算中性提示词的嵌入
+        neutral_input_ids = batch["neutral_input_ids"].to(accelerator.device)
+        neutral_input_ids2 = batch["neutral_input_ids2"].to(accelerator.device)
+        encoder_hidden_states1_neutral, encoder_hidden_states2_neutral, pool2_neutral = train_util.get_hidden_states_sdxl(
+            args.max_token_length,
+            neutral_input_ids,
+            neutral_input_ids2,
+            tokenizers[0],
+            tokenizers[1],
+            text_encoders[0],
+            text_encoders[1],
+            None if not args.full_fp16 else weight_dtype,
+            accelerator=accelerator,
+        )
+
+        # 计算无条件提示词的嵌入
+        unconditional_input_ids = batch["unconditional_input_ids"].to(accelerator.device)
+        unconditional_input_ids2 = batch["unconditional_input_ids2"].to(accelerator.device)
+        encoder_hidden_states1_uncond, encoder_hidden_states2_uncond, pool2_uncond = train_util.get_hidden_states_sdxl(
+            args.max_token_length,
+            unconditional_input_ids,
+            unconditional_input_ids2,
+            tokenizers[0],
+            tokenizers[1],
+            text_encoders[0],
+            text_encoders[1],
+            None if not args.full_fp16 else weight_dtype,
+            accelerator=accelerator,
+        )
+
+        # 根据操作类型调整嵌入
+        guidance_scale = 1.0  # 可以根据需要调整
+        action = "enhance"  # 或者 "erase"
+
+        if action == "erase":
+            encoder_hidden_states1 = encoder_hidden_states1_neutral - guidance_scale * (encoder_hidden_states1_positive - encoder_hidden_states1_uncond)
+            encoder_hidden_states2 = encoder_hidden_states2_neutral - guidance_scale * (encoder_hidden_states2_positive - encoder_hidden_states2_uncond)
+            pool2 = pool2_neutral - guidance_scale * (pool2_positive - pool2_uncond)
+        elif action == "enhance":
+            encoder_hidden_states1 = encoder_hidden_states1_neutral + guidance_scale * (encoder_hidden_states1_positive - encoder_hidden_states1_uncond)
+            encoder_hidden_states2 = encoder_hidden_states2_neutral + guidance_scale * (encoder_hidden_states2_positive - encoder_hidden_states2_uncond)
+            pool2 = pool2_neutral + guidance_scale * (pool2_positive - pool2_uncond)
+        else:
+            raise ValueError("action must be 'erase' or 'enhance'")
 
         return encoder_hidden_states1, encoder_hidden_states2, pool2
 

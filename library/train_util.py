@@ -1164,7 +1164,13 @@ class BaseDataset(torch.utils.data.Dataset):
         loss_weights = []
         captions = []
         input_ids_list = []
+        positive_input_ids_list = []
+        neutral_input_ids_list = []
+        unconditional_input_ids_list = []
         input_ids2_list = []
+        positive_input_ids2_list = []
+        neutral_input_ids2_list = []
+        unconditional_input_ids2_list = []
         latents_list = []
         images = []
         images_dst = []  # 用于存储差异图片
@@ -1175,6 +1181,14 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
         text_encoder_pool2_list = []
+
+        # === Added code ===
+        # 在方法开始处添加硬编码的提示词和相关参数
+        positive_prompt = "1girl"
+        neutral_prompt = ""
+        unconditional_prompt = ""
+        action = "enhance"  # 或者 "erase"
+        guidance_scale = 1.0  # 根据需要调整
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1323,6 +1337,25 @@ class BaseDataset(torch.utils.data.Dataset):
                             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                         input_ids2_list.append(token_caption2)
 
+            # === Added code ===
+            # 获取硬编码提示词的 input_ids 并添加到相应的列表中
+            # 对于第一个 tokenizer
+            positive_input_ids = self.get_input_ids(positive_prompt, self.tokenizers[0])
+            neutral_input_ids = self.get_input_ids(neutral_prompt, self.tokenizers[0])
+            unconditional_input_ids = self.get_input_ids(unconditional_prompt, self.tokenizers[0])
+            positive_input_ids_list.append(positive_input_ids)
+            neutral_input_ids_list.append(neutral_input_ids)
+            unconditional_input_ids_list.append(unconditional_input_ids)
+
+            if len(self.tokenizers) > 1:
+                positive_input_ids2 = self.get_input_ids(positive_prompt, self.tokenizers[1])
+                neutral_input_ids2 = self.get_input_ids(neutral_prompt, self.tokenizers[1])
+                unconditional_input_ids2 = self.get_input_ids(unconditional_prompt, self.tokenizers[1])
+                positive_input_ids2_list.append(positive_input_ids2)
+                neutral_input_ids2_list.append(neutral_input_ids2)
+                unconditional_input_ids2_list.append(unconditional_input_ids2)
+            # === End of added code ===
+
         example = {}
         example["loss_weights"] = torch.FloatTensor(loss_weights)
 
@@ -1376,6 +1409,25 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+
+        # === Added code ===
+        # 将硬编码提示词的 input_ids 和参数添加到 example 中
+        example["positive_input_ids"] = torch.stack(positive_input_ids_list)
+        example["neutral_input_ids"] = torch.stack(neutral_input_ids_list)
+        example["unconditional_input_ids"] = torch.stack(unconditional_input_ids_list)
+        if len(self.tokenizers) > 1:
+            example["positive_input_ids2"] = torch.stack(positive_input_ids2_list)
+            example["neutral_input_ids2"] = torch.stack(neutral_input_ids2_list)
+            example["unconditional_input_ids2"] = torch.stack(unconditional_input_ids2_list)
+        else:
+            example["positive_input_ids2"] = None
+            example["neutral_input_ids2"] = None
+            example["unconditional_input_ids2"] = None
+
+        example["action"] = action
+        example["guidance_scale"] = guidance_scale
+        # === End of added code ===
+
         return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
