@@ -1167,6 +1167,7 @@ class BaseDataset(torch.utils.data.Dataset):
         input_ids2_list = []
         latents_list = []
         images = []
+        images_dst = []  # 用于存储差异图片
         original_sizes_hw = []
         crop_top_lefts = []
         target_sizes_hw = []
@@ -1207,13 +1208,27 @@ class BaseDataset(torch.utils.data.Dataset):
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(subset, image_info.absolute_path)
                 im_h, im_w = img.shape[0:2]
 
+                # 使用自动构建的路径加载差异图片
+                dst_folder_path = os.path.join(os.path.dirname(image_info.absolute_path) + "_dst")
+                dst_image_path = os.path.join(dst_folder_path, os.path.basename(image_info.absolute_path))
+                
+                if not os.path.exists(dst_image_path):
+                    print(f"差异图像未找到: {dst_image_path}")
+                    exit(1)  # 打印路径并退出
+                
+                img_dst = load_image(dst_image_path)
+
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
                         subset.random_crop, img, image_info.bucket_reso, image_info.resized_size
                     )
+                    img_dst, _, _ = trim_and_resize_if_required(
+                        subset.random_crop, img_dst, image_info.bucket_reso, image_info.resized_size
+                    )
                 else:
                     if face_cx > 0:  # 顔位置情報あり
                         img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
+                        img_dst = self.crop_target(subset, img_dst, face_cx, face_cy, face_w, face_h)
                     elif im_h > self.height or im_w > self.width:
                         assert (
                             subset.random_crop
@@ -1221,9 +1236,11 @@ class BaseDataset(torch.utils.data.Dataset):
                         if im_h > self.height:
                             p = random.randint(0, im_h - self.height)
                             img = img[p : p + self.height]
+                            img_dst = img_dst[p : p + self.height]
                         if im_w > self.width:
                             p = random.randint(0, im_w - self.width)
                             img = img[:, p : p + self.width]
+                            img_dst = img_dst[:, p : p + self.width]
 
                     im_h, im_w = img.shape[0:2]
                     assert (
@@ -1237,14 +1254,18 @@ class BaseDataset(torch.utils.data.Dataset):
                 aug = self.aug_helper.get_augmentor(subset.color_aug)
                 if aug is not None:
                     img = aug(image=img)["image"]
+                    img_dst = aug(image=img_dst)["image"]
 
                 if flipped:
                     img = img[:, ::-1, :].copy()  # copy to avoid negative stride problem
+                    img_dst = img_dst[:, ::-1, :].copy()
 
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
+                image_dst = self.image_transforms(img_dst)
 
             images.append(image)
+            images_dst.append(image_dst)
             latents_list.append(latents)
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
@@ -1334,9 +1355,14 @@ class BaseDataset(torch.utils.data.Dataset):
         if images[0] is not None:
             images = torch.stack(images)
             images = images.to(memory_format=torch.contiguous_format).float()
+            images_dst = torch.stack(images_dst)
+            images_dst = images_dst.to(memory_format=torch.contiguous_format).float()
         else:
             images = None
+            images_dst = None
+
         example["images"] = images
+        example["images_dst"] = images_dst
 
         example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
         example["captions"] = captions
@@ -4929,7 +4955,36 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     return noise, noisy_latents, timesteps, huber_c
+    
+def get_noise_noisy_latents_and_timesteps_sliders(args, noise_scheduler, latents, fixed_timesteps):
+    # Sample noise that we'll add to the latents
+    noise = torch.randn_like(latents, device=latents.device)
+    if args.noise_offset:
+        if args.noise_offset_random_strength:
+            noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
+        else:
+            noise_offset = args.noise_offset
+        noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
+    if args.multires_noise_iterations:
+        noise = custom_train_functions.pyramid_noise_like(
+            noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
+        )
 
+    huber_c = 1
+    timesteps = noise_scheduler.timesteps[fixed_timesteps:fixed_timesteps+1].to(latents.device)
+
+    # Add noise to the latents according to the noise magnitude at each timestep
+    # (this is the forward diffusion process)
+    if args.ip_noise_gamma:
+        if args.ip_noise_gamma_random_strength:
+            strength = torch.rand(1, device=latents.device) * args.ip_noise_gamma
+        else:
+            strength = args.ip_noise_gamma
+        noisy_latents = noise_scheduler.add_noise(latents, noise + strength * torch.randn_like(latents), timesteps)
+    else:
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    return noise, noisy_latents, timesteps, huber_c
 
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
 def conditional_loss(

@@ -812,12 +812,14 @@ class NetworkTrainer:
                         with torch.no_grad():
                             # latentに変換
                             latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
+                            latents_dst = vae.encode(batch["images_dst"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
 
                             # NaNが含まれていれば警告を表示し0に置き換える
                             if torch.any(torch.isnan(latents)):
                                 accelerator.print("NaN found in latents, replacing with zeros")
                                 latents = torch.nan_to_num(latents, 0, out=latents)
                     latents = latents * self.vae_scale_factor
+                    latents_dst = latents_dst * self.vae_scale_factor
 
                     # get multiplier for each sample
                     if network_has_multiplier:
@@ -846,19 +848,34 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
+                    timesteps_to = torch.randint(
+                        1, noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep, (1,)
+                    ).item()
+                    seed = random.randint(0,2*15)
+                    noise_scheduler.set_timesteps(1000)
+                    
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
-                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                    torch.manual_seed(seed)
+                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps_sliders(
+                        args, noise_scheduler, latents, timesteps_to
+                    )
+                    torch.manual_seed(seed)
+                    noise, noisy_latents_dst, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps_sliders(
+                        args, noise_scheduler, latents_dst, timesteps_to
                     )
 
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
                         for x in noisy_latents:
                             x.requires_grad_(True)
+                        for x2 in noisy_latents_dst:
+                            x2.requires_grad_(True)
                         for t in text_encoder_conds:
                             t.requires_grad_(True)
 
+                    # 原图loss
+                    accelerator.unwrap_model(network).set_multiplier(1)
                     # Predict the noise residual
                     with accelerator.autocast():
                         noise_pred = self.call_unet(
@@ -875,6 +892,49 @@ class NetworkTrainer:
                     if args.v_parameterization:
                         # v-parameterization training
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        target = noise
+
+                    loss = train_util.conditional_loss(
+                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                    )
+                    if args.masked_loss:
+                        loss = apply_masked_loss(loss, batch)
+                    loss = loss.mean([1, 2, 3])
+
+                    loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+                    loss = loss * loss_weights
+
+                    if args.min_snr_gamma:
+                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+                    if args.scale_v_pred_loss_like_noise_pred:
+                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+                    if args.v_pred_like_loss:
+                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                    if args.debiased_estimation_loss:
+                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+
+                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+
+                    accelerator.backward(loss)
+                    
+                    # 目标loss
+                    accelerator.unwrap_model(network).set_multiplier(-1)
+                    with accelerator.autocast():
+                        noise_pred = self.call_unet(
+                            args,
+                            accelerator,
+                            unet,
+                            noisy_latents_dst.requires_grad_(train_unet),
+                            timesteps,
+                            text_encoder_conds,
+                            batch,
+                            weight_dtype,
+                        )
+
+                    if args.v_parameterization:
+                        # v-parameterization training
+                        target = noise_scheduler.get_velocity(latents_dst, noise, timesteps)
                     else:
                         target = noise
 
